@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <threads.h>
 #include <time.h>
 
 enum slog_level {
@@ -56,93 +57,73 @@ struct slog_field {
 
 const struct slog_field slog_field_default;
 
-struct slog_alloc {
-	struct {
-		struct slog_field *pool;
-		size_t length, capacity;
-	} field;
+static thread_local struct slog_field *slog_field_tls = NULL;
 
-	struct {
-		char *buffer;
-		size_t size, capacity;
-	} output;
-};
+#define SLOG_OUTPUT_SIZE 4096
+static thread_local char output_buffer[SLOG_OUTPUT_SIZE] = {0};
+static thread_local size_t output_index = 1; // strlen() + 1
 
-void slog_alloc_init(struct slog_alloc *alloc, size_t capacity) {
-	if (capacity == 0) {
-		capacity = 32;
+struct slog_field *slog_field_get() {
+	struct slog_field *field;
+
+	if (slog_field_tls) {
+		field = slog_field_tls;
+		slog_field_tls = field->next;
+	} else {
+		field = calloc(1, sizeof(*field));
 	}
-
-	alloc->field.pool = calloc(capacity, sizeof(struct slog_field));
-	alloc->field.length = 0;
-	alloc->field.capacity = capacity;
-
-	alloc->output.buffer = calloc(capacity * 32, sizeof(char));
-	alloc->output.size = 1; // it's '\0'
-	alloc->output.capacity = capacity * 32;
-}
-
-void slog_alloc_fini(struct slog_alloc *alloc) {
-	free(alloc->field.pool);
-	free(alloc->output.buffer);
-}
-
-struct slog_field *slog_alloc_field(struct slog_alloc *alloc) {
-	assert(alloc);
-	assert(alloc->field.capacity);
-
-	if (alloc->field.capacity == alloc->field.length) {
-		size_t new_capacity = alloc->field.capacity + 16;
-		alloc->field.pool =
-			reallocarray(alloc->field.pool, new_capacity,
-				     sizeof(struct slog_field));
-		alloc->field.capacity = new_capacity;
-	}
-	struct slog_field *field = &alloc->field.pool[alloc->field.length++];
 	*field = slog_field_default;
 	return field;
 }
 
-// output.size = strlen(string) + 1
-void slog_alloc_vfmt(struct slog_alloc *alloc, const char *fmt, ...) {
-	if (!fmt) {
+void slog_field_put(struct slog_field *field) {
+	if (!field) {
+		return;
+	}
+	field->next = slog_field_tls;
+	slog_field_tls = field;
+}
+
+void slog_field_free(struct slog_field *field) {
+	if (!field) {
+		return;
+	}
+	struct slog_field *child, *next;
+	switch (field->type) {
+	case SLOG_TYPE_OBJECT:
+	case SLOG_TYPE_PLAIN:
+		child = field->value.object;
+		while (child) {
+			next = child->next;
+			slog_field_free(child);
+			child = next;
+		}
+		break;
+	default:
+		break;
+	}
+	slog_field_put(field);
+}
+
+void slog_vfmt(const char *fmt, ...) {
+	if (!fmt || output_index >= SLOG_OUTPUT_SIZE) {
 		return;
 	}
 
 	va_list args;
 	va_start(args, fmt);
-	int count = vsnprintf(NULL, 0, fmt, args);
+	// vprintf(fmt, args);
+	int written = vsnprintf(output_buffer + output_index - 1,
+				SLOG_OUTPUT_SIZE - output_index + 1, fmt, args);
 	va_end(args);
-
-	if (count <= 0) {
-		return;
-	}
-
-	if (alloc->output.size + count > alloc->output.capacity) {
-		size_t new_capacity = count > alloc->output.capacity
-					      ? alloc->output.capacity + count
-					      : alloc->output.capacity * 2;
-		alloc->output.buffer =
-			realloc(alloc->output.buffer, new_capacity);
-		alloc->output.capacity = new_capacity;
-	}
-
-	va_start(args, fmt);
-	int written = vsnprintf(alloc->output.buffer + alloc->output.size - 1,
-				alloc->output.capacity - alloc->output.size + 1,
-				fmt, args);
-	va_end(args);
-
 	if (written > 0) {
-		alloc->output.size += written;
-		alloc->output.buffer[alloc->output.size - 1] = '\0';
+		output_index += written;
 	}
 }
 
-struct slog_field *slog_new_vfield(struct slog_alloc *alloc,
-				   enum slog_type type, const char *key,
+struct slog_field *slog_field_vnew(enum slog_type type, const char *key,
 				   va_list ap) {
-	struct slog_field *field = slog_alloc_field(alloc);
+	struct slog_field *field = slog_field_get();
 	field->key = key;
 	field->type = type;
 
@@ -180,58 +161,57 @@ struct slog_field *slog_new_vfield(struct slog_alloc *alloc,
 	return field;
 }
 
-struct slog_field *slog_new_field(struct slog_alloc *alloc, enum slog_type type,
-				  const char *key, ...) {
+struct slog_field *slog_field_new(enum slog_type type, const char *key, ...) {
 	va_list ap;
 	va_start(ap, key);
-	struct slog_field *field = slog_new_vfield(alloc, type, key, ap);
+	struct slog_field *field = slog_field_vnew(type, key, ap);
 	va_end(ap);
 	return field;
 }
 
-void slog_fmt_escape(struct slog_alloc *alloc, const char *str) {
+void slog_fmt_escape(const char *str) {
 	assert(str);
 
-	slog_alloc_vfmt(alloc, "\"");
+	slog_vfmt("\"");
 
 	for (const char *p = str; *p; p++) {
 		unsigned char c = *p;
 
 		switch (c) {
 		case '"':
-			slog_alloc_vfmt(alloc, "\\\"");
+			slog_vfmt("\\\"");
 			break;
 		case '\\':
-			slog_alloc_vfmt(alloc, "\\\\");
+			slog_vfmt("\\\\");
 			break;
 		case '\b':
-			slog_alloc_vfmt(alloc, "\\b");
+			slog_vfmt("\\b");
 			break;
 		case '\f':
-			slog_alloc_vfmt(alloc, "\\f");
+			slog_vfmt("\\f");
 			break;
 		case '\n':
-			slog_alloc_vfmt(alloc, "\\n");
+			slog_vfmt("\\n");
 			break;
 		case '\r':
-			slog_alloc_vfmt(alloc, "\\r");
+			slog_vfmt("\\r");
 			break;
 		case '\t':
-			slog_alloc_vfmt(alloc, "\\t");
+			slog_vfmt("\\t");
 			break;
 		default:
 			if (c < 0x20) {
-				slog_alloc_vfmt(alloc, "\\u%04x", c);
+				slog_vfmt("\\u%04x", c);
 			} else {
-				slog_alloc_vfmt(alloc, "%c", c);
+				slog_vfmt("%c", c);
 			}
 			break;
 		}
 	}
-	slog_alloc_vfmt(alloc, "\"");
+	slog_vfmt("\"");
 }
 
-void slog_fmt_time(struct slog_alloc *alloc, struct slog_field *field) {
+void slog_fmt_time(struct slog_field *field) {
 	assert(field->type == SLOG_TYPE_TIME);
 
 	struct tm *t = localtime(&field->value.time.tv_sec);
@@ -239,99 +219,96 @@ void slog_fmt_time(struct slog_alloc *alloc, struct slog_field *field) {
 	// YYYY-MM-DD HH:MM:SS.mmm
 	// 2025-11-16 11:15:25.123
 
-	slog_alloc_vfmt(
-		alloc, "\"time\": \"%04d-%02d-%02d %02d:%02d:%02d.%03ld\"",
-		t->tm_year + 1900, t->tm_mon + 1, t->tm_mday, t->tm_hour,
-		t->tm_min, t->tm_sec, field->value.time.tv_nsec / 1000000);
+	slog_vfmt("\"time\": \"%04d-%02d-%02d %02d:%02d:%02d.%03ld\"",
+		  t->tm_year + 1900, t->tm_mon + 1, t->tm_mday, t->tm_hour,
+		  t->tm_min, t->tm_sec, field->value.time.tv_nsec / 1000000);
 }
 
-void slog_fmt_field(struct slog_alloc *alloc, struct slog_field *field) {
+void slog_field_fmt(struct slog_field *field) {
 	while (field) {
 		if (field->key) {
-			slog_fmt_escape(alloc, field->key);
-			slog_alloc_vfmt(alloc, ": ");
+			slog_fmt_escape(field->key);
+			slog_vfmt(": ");
 		}
 		switch (field->type) {
 		case SLOG_TYPE_STRING:
-			slog_fmt_escape(alloc, field->value.string);
+			slog_fmt_escape(field->value.string);
 			break;
 		case SLOG_TYPE_BOOL:
-			slog_alloc_vfmt(alloc, "%s",
-					field->value.boolean ? "true"
-							     : "false");
+			slog_vfmt("%s",
+				  field->value.boolean ? "true" : "false");
 			break;
 		case SLOG_TYPE_INT:
-			slog_alloc_vfmt(alloc, "%lld", field->value.integer);
+			slog_vfmt("%lld", field->value.integer);
 			break;
 		case SLOG_TYPE_FLOAT:
-			slog_alloc_vfmt(alloc, "%f", field->value.number);
+			slog_vfmt("%f", field->value.number);
 			break;
 		case SLOG_TYPE_OBJECT:
-			slog_alloc_vfmt(alloc, "{");
-			slog_fmt_field(alloc, field->value.object);
-			slog_alloc_vfmt(alloc, "}");
+			slog_vfmt("{");
+			slog_field_fmt(field->value.object);
+			slog_vfmt("}");
 			break;
 		case SLOG_TYPE_PLAIN:
 			assert(!field->key);
-			slog_fmt_field(alloc, field->value.object);
+			slog_field_fmt(field->value.object);
 			break;
 		case SLOG_TYPE_TIME:
-			slog_fmt_time(alloc, field);
+			slog_fmt_time(field);
 			break;
 		default:
 			break;
 		}
 		field = field->next;
 		if (field) {
-			slog_alloc_vfmt(alloc, ", ");
+			slog_vfmt(", ");
 		}
 	}
 }
 
-static void slog_main(struct slog_alloc *alloc, const char *file,
-		      const int line, const char *func, const char *level,
-		      const char *msg, ...) {
+static void slog_main(const char *file, const int line, const char *func,
+		      const char *level, const char *msg, ...) {
 	va_list fields;
 	va_start(fields, msg);
 	struct slog_field *extra =
-		slog_new_vfield(alloc, SLOG_TYPE_PLAIN, NULL, fields);
+		slog_field_vnew(SLOG_TYPE_PLAIN, NULL, fields);
 	va_end(fields);
 
 	if (strncmp(level, "SLOG_", 5) == 0) {
 		level = level + 5;
 	}
 
-	struct slog_field *root = slog_new_field(
-		alloc, SLOG_TYPE_OBJECT, NULL,
-		slog_new_field(alloc, SLOG_TYPE_STRING, "file", file),
-		slog_new_field(alloc, SLOG_TYPE_INT, "line", line),
-		slog_new_field(alloc, SLOG_TYPE_STRING, "func", func),
-		slog_new_field(alloc, SLOG_TYPE_STRING, "level", level),
-		slog_new_field(alloc, SLOG_TYPE_STRING, "msg", msg),
-		slog_new_field(alloc, SLOG_TYPE_TIME, NULL), extra, NULL);
+	struct slog_field *root = slog_field_new(
+		SLOG_TYPE_OBJECT, NULL,
+		slog_field_new(SLOG_TYPE_STRING, "file", file),
+		slog_field_new(SLOG_TYPE_INT, "line", line),
+		slog_field_new(SLOG_TYPE_STRING, "func", func),
+		slog_field_new(SLOG_TYPE_STRING, "level", level),
+		slog_field_new(SLOG_TYPE_STRING, "msg", msg),
+		slog_field_new(SLOG_TYPE_TIME, NULL), extra, NULL);
 
-	slog_fmt_field(alloc, root);
+	output_index = 1;
+	output_buffer[0] = '\0';
 
-	fprintf(stdout, "%s\n", alloc->output.buffer);
+	slog_field_fmt(root);
+
+	slog_field_free(root);
+
+	fprintf(stdout, "%s\n", output_buffer);
 	fflush(stdout);
 }
 
-#define SLOG_ALLOC slog_alloc
-#define SLOG_BOOL(K, V) slog_new_field(&SLOG_ALLOC, SLOG_TYPE_BOOL, K, V)
-#define SLOG_FLOAT(K, V) slog_new_field(&SLOG_ALLOC, SLOG_TYPE_FLOAT, K, V)
-#define SLOG_STRING(K, V) slog_new_field(&SLOG_ALLOC, SLOG_TYPE_STRING, K, V)
-#define SLOG_INT(K, V) slog_new_field(&SLOG_ALLOC, SLOG_TYPE_INT, K, V)
+#define SLOG_BOOL(K, V) slog_field_new(SLOG_TYPE_BOOL, K, V)
+#define SLOG_FLOAT(K, V) slog_field_new(SLOG_TYPE_FLOAT, K, V)
+#define SLOG_STRING(K, V) slog_field_new(SLOG_TYPE_STRING, K, V)
+#define SLOG_INT(K, V) slog_field_new(SLOG_TYPE_INT, K, V)
 #define SLOG_OBJECT(K, ...)                                                    \
-	slog_new_field(&SLOG_ALLOC, SLOG_TYPE_OBJECT,                          \
-		       K __VA_OPT__(, ) __VA_ARGS__, NULL)
+	slog_field_new(SLOG_TYPE_OBJECT, K __VA_OPT__(, ) __VA_ARGS__, NULL)
 
 #define SLOG(LEVEL, MSG, ...)                                                  \
 	do {                                                                   \
-		struct slog_alloc SLOG_ALLOC = {0};                            \
-		slog_alloc_init(&SLOG_ALLOC, 0);                               \
-		slog_main(&SLOG_ALLOC, __FILE__, __LINE__, __func__, #LEVEL,   \
-			  MSG, ##__VA_ARGS__, NULL);                           \
-		slog_alloc_fini(&SLOG_ALLOC);                                  \
+		slog_main(__FILE__, __LINE__, __func__, #LEVEL, MSG,           \
+			  ##__VA_ARGS__, NULL);                                \
 	} while (0)
 
 #endif // SLOG_H
