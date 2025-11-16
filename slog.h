@@ -33,6 +33,7 @@ enum slog_type {
 	SLOG_TYPE_TIME,
 	// SLOG_ARRAY,··
 	SLOG_TYPE_OBJECT,
+	SLOG_TYPE_PLAIN,
 };
 
 struct slog_field {
@@ -166,6 +167,8 @@ struct slog_field *slog_new_vfield(struct slog_alloc *alloc,
 		clock_gettime(CLOCK_REALTIME, &field->value.time);
 		break;
 	// case SLOG_ARRAY:
+	case SLOG_TYPE_PLAIN:
+		assert(!key);
 	case SLOG_TYPE_OBJECT:
 		pp = &field->value.object;
 		while ((p = va_arg(ap, struct slog_field *)) != NULL) {
@@ -243,7 +246,6 @@ void slog_fmt_time(struct slog_alloc *alloc, struct slog_field *field) {
 }
 
 void slog_fmt_field(struct slog_alloc *alloc, struct slog_field *field) {
-	slog_alloc_vfmt(alloc, "{");
 	while (field) {
 		if (field->key) {
 			slog_fmt_escape(alloc, field->key);
@@ -265,6 +267,12 @@ void slog_fmt_field(struct slog_alloc *alloc, struct slog_field *field) {
 			slog_alloc_vfmt(alloc, "%f", field->value.number);
 			break;
 		case SLOG_TYPE_OBJECT:
+			slog_alloc_vfmt(alloc, "{");
+			slog_fmt_field(alloc, field->value.object);
+			slog_alloc_vfmt(alloc, "}");
+			break;
+		case SLOG_TYPE_PLAIN:
+			assert(!field->key);
 			slog_fmt_field(alloc, field->value.object);
 			break;
 		case SLOG_TYPE_TIME:
@@ -278,7 +286,6 @@ void slog_fmt_field(struct slog_alloc *alloc, struct slog_field *field) {
 			slog_alloc_vfmt(alloc, ", ");
 		}
 	}
-	slog_alloc_vfmt(alloc, "}");
 }
 
 static void slog_main(struct slog_alloc *alloc, const char *file,
@@ -287,7 +294,7 @@ static void slog_main(struct slog_alloc *alloc, const char *file,
 	va_list fields;
 	va_start(fields, msg);
 	struct slog_field *extra =
-		slog_new_vfield(alloc, SLOG_TYPE_OBJECT, "extra", fields);
+		slog_new_vfield(alloc, SLOG_TYPE_PLAIN, NULL, fields);
 	va_end(fields);
 
 	if (strncmp(level, "SLOG_", 5) == 0) {
@@ -300,9 +307,10 @@ static void slog_main(struct slog_alloc *alloc, const char *file,
 		slog_new_field(alloc, SLOG_TYPE_INT, "line", line),
 		slog_new_field(alloc, SLOG_TYPE_STRING, "func", func),
 		slog_new_field(alloc, SLOG_TYPE_STRING, "level", level),
+		slog_new_field(alloc, SLOG_TYPE_STRING, "msg", msg),
 		slog_new_field(alloc, SLOG_TYPE_TIME, NULL), extra, NULL);
 
-	slog_fmt_field(alloc, root->value.object);
+	slog_fmt_field(alloc, root);
 
 	fprintf(stdout, "%s\n", alloc->output.buffer);
 	fflush(stdout);
